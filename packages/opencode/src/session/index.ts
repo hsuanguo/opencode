@@ -546,7 +546,7 @@ export namespace Session {
     const conditions = [eq(SessionTable.project_id, project.id)]
 
     if (WorkspaceContext.workspaceID) {
-      conditions.push(eq(SessionTable.workspace_id, WorkspaceContext.workspaceID))
+      conditions.push(or(eq(SessionTable.workspace_id, WorkspaceContext.workspaceID), isNull(SessionTable.workspace_id))!)
     }
     if (input?.directory) {
       conditions.push(eq(SessionTable.directory, input.directory))
