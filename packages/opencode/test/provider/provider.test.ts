@@ -1,9 +1,11 @@
 import { afterEach, expect, test } from "bun:test"
 import { mkdir, unlink } from "fs/promises"
 import path from "path"
+import { LayerNode } from "@opencode-ai/core/effect/layer-node"
+import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
 import { Effect, Layer } from "effect"
 import { ModelsDev } from "@opencode-ai/core/models-dev"
-import { AppFileSystem } from "@opencode-ai/core/filesystem"
+import { FSUtil } from "@opencode-ai/core/fs-util"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { Global } from "@opencode-ai/core/global"
 import { disposeAllInstances, provideInstanceEffect, tmpdirScoped, TestInstance } from "../fixture/fixture"
@@ -16,9 +18,11 @@ import { Provider } from "@/provider/provider"
 
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { Filesystem } from "@/util/filesystem"
-import { InstanceLayer } from "@/project/instance-layer"
+import { InstanceBootstrap } from "@/project/bootstrap"
+import { InstanceStore } from "@/project/instance-store"
 import { testEffect } from "../lib/effect"
 import { ProviderV2 } from "@opencode-ai/core/provider"
+import { ModelV2 } from "@opencode-ai/core/model"
 
 const originalEnv = new Map<string, string | undefined>()
 
@@ -56,14 +60,18 @@ afterEach(async () => {
 })
 
 const providerLayer = (flags: Partial<RuntimeFlags.Info> = {}) =>
-  Provider.layer.pipe(
-    Layer.provide(AppFileSystem.defaultLayer),
-    Layer.provide(Env.defaultLayer),
-    Layer.provide(Config.defaultLayer),
-    Layer.provide(Auth.defaultLayer),
-    Layer.provide(Plugin.defaultLayer),
-    Layer.provide(ModelsDev.defaultLayer),
-    Layer.provide(RuntimeFlags.layer(flags)),
+  LayerNode.compile(
+    LayerNode.group([
+      Provider.node,
+      FSUtil.node,
+      Env.node,
+      Config.node,
+      Auth.node,
+      Plugin.node,
+      ModelsDev.node,
+      RuntimeFlags.node,
+    ]),
+    [[RuntimeFlags.node, RuntimeFlags.layer(flags)]],
   )
 
 const list = Provider.use.list()
@@ -76,7 +84,7 @@ const paid = (providers: Record<string, { models: Record<string, { cost: { input
 
 const languageBaseURL = (language: unknown) => (language as { config: { baseURL: string } }).config.baseURL
 
-const it = testEffect(Layer.mergeAll(Provider.defaultLayer, Env.defaultLayer, Plugin.defaultLayer))
+const it = testEffect(LayerNode.compile(LayerNode.group([Provider.node, Env.node, Plugin.node])))
 const experimentalModels = testEffect(providerLayer({ enableExperimentalModels: true }))
 
 const alphaProviderConfig = {
@@ -293,7 +301,7 @@ it.instance("getModel returns model for valid provider/model", () =>
   Effect.gen(function* () {
     yield* setProcessEnv("ANTHROPIC_API_KEY", "test-api-key")
     const provider = yield* Provider.Service
-    const model = yield* provider.getModel(ProviderV2.ID.anthropic, ProviderV2.ModelID.make("claude-sonnet-4-20250514"))
+    const model = yield* provider.getModel(ProviderV2.ID.anthropic, ModelV2.ID.make("claude-sonnet-4-20250514"))
     expect(model).toBeDefined()
     expect(String(model.providerID)).toBe("anthropic")
     expect(String(model.id)).toBe("claude-sonnet-4-20250514")
@@ -306,7 +314,7 @@ it.instance("getModel throws ModelNotFoundError for invalid model", () =>
   Effect.gen(function* () {
     yield* set("ANTHROPIC_API_KEY", "test-api-key")
     const exit = yield* Provider.use
-      .getModel(ProviderV2.ID.anthropic, ProviderV2.ModelID.make("nonexistent-model"))
+      .getModel(ProviderV2.ID.anthropic, ModelV2.ID.make("nonexistent-model"))
       .pipe(Effect.exit)
     expect(exit._tag).toBe("Failure")
   }),
@@ -315,7 +323,7 @@ it.instance("getModel throws ModelNotFoundError for invalid model", () =>
 it.instance("getModel throws ModelNotFoundError for invalid provider", () =>
   Effect.gen(function* () {
     const exit = yield* Provider.use
-      .getModel(ProviderV2.ID.make("nonexistent-provider"), ProviderV2.ModelID.make("some-model"))
+      .getModel(ProviderV2.ID.make("nonexistent-provider"), ModelV2.ID.make("some-model"))
       .pipe(Effect.exit)
     expect(exit._tag).toBe("Failure")
   }),
@@ -353,6 +361,17 @@ it.instance(
     expect(String(model.modelID)).toBe("claude-sonnet-4-20250514")
   }),
   { config: { model: "anthropic/claude-sonnet-4-20250514" } },
+)
+
+it.instance(
+  "defaultModel treats empty provider config as no allowlist",
+  Effect.gen(function* () {
+    yield* setProcessEnv("ANTHROPIC_API_KEY", "test-api-key")
+    const model = yield* Provider.use.defaultModel()
+    expect(model.providerID).toBeDefined()
+    expect(model.modelID).toBeDefined()
+  }),
+  { config: { provider: {} } },
 )
 
 it.instance(
@@ -464,7 +483,7 @@ it.instance(
     const providers = yield* list
     expect(providers[ProviderV2.ID.anthropic].models["my-sonnet"]).toBeDefined()
 
-    const model = yield* Provider.use.getModel(ProviderV2.ID.anthropic, ProviderV2.ModelID.make("my-sonnet"))
+    const model = yield* Provider.use.getModel(ProviderV2.ID.anthropic, ModelV2.ID.make("my-sonnet"))
     expect(model).toBeDefined()
     expect(String(model.id)).toBe("my-sonnet")
     expect(model.name).toBe("My Sonnet Alias")
@@ -648,6 +667,102 @@ it.instance("getSmallModel returns appropriate small model", () =>
     const model = yield* Provider.use.getSmallModel(ProviderV2.ID.anthropic)
     expect(model).toBeDefined()
     expect(model?.id).toContain("haiku")
+  }),
+)
+
+it.instance("getSmallModel prefers Gemini for Google Vertex", () =>
+  Effect.gen(function* () {
+    yield* set("GOOGLE_VERTEX_PROJECT", "test-project")
+    const model = yield* Provider.use.getSmallModel(ProviderV2.ID.googleVertex)
+    expect(model).toBeDefined()
+    expect(model?.id).toContain("gemini")
+  }),
+)
+
+it.instance(
+  "getSmallModel selects the latest model in the preferred family",
+  Effect.gen(function* () {
+    const model = yield* Provider.use.getSmallModel(ProviderV2.ID.make("test-provider"))
+    expect(model?.id).toBe(ModelV2.ID.make("new-flash"))
+  }),
+  {
+    config: {
+      provider: {
+        "test-provider": {
+          name: "Test Provider",
+          npm: "@ai-sdk/openai-compatible",
+          models: {
+            "old-flash": { family: "gemini-flash", release_date: "2025-01-01" },
+            "new-flash": { family: "gemini-flash", release_date: "2026-01-01" },
+            "newer-haiku": { family: "claude-haiku", release_date: "2026-06-01" },
+          },
+          options: { apiKey: "test-key" },
+        },
+      },
+    },
+  },
+)
+
+it.instance(
+  "getSmallModel matches exact model families",
+  Effect.gen(function* () {
+    const model = yield* Provider.use.getSmallModel(ProviderV2.ID.make("test-provider"))
+    expect(model?.id).toBe(ModelV2.ID.make("claude-haiku"))
+  }),
+  {
+    config: {
+      provider: {
+        "test-provider": {
+          name: "Test Provider",
+          npm: "@ai-sdk/openai-compatible",
+          models: {
+            "glm-flash": { family: "glm-flash", release_date: "2026-06-01" },
+            "claude-haiku": { family: "claude-haiku", release_date: "2026-01-01" },
+          },
+          options: { apiKey: "test-key" },
+        },
+      },
+    },
+  },
+)
+
+it.instance(
+  "getSmallModel ignores model IDs without family metadata",
+  Effect.gen(function* () {
+    const model = yield* Provider.use.getSmallModel(ProviderV2.ID.make("test-provider"))
+    expect(model).toBeUndefined()
+  }),
+  {
+    config: {
+      provider: {
+        "test-provider": {
+          name: "Test Provider",
+          npm: "@ai-sdk/openai-compatible",
+          models: {
+            "gpt-5-nano": { release_date: "2026-01-01" },
+          },
+          options: { apiKey: "test-key" },
+        },
+      },
+    },
+  },
+)
+
+it.instance("getSmallModel skips inferred models for Azure", () =>
+  Effect.gen(function* () {
+    yield* set("AZURE_RESOURCE_NAME", "test-resource")
+    yield* set("AZURE_API_KEY", "test-key")
+    const model = yield* Provider.use.getSmallModel(ProviderV2.ID.azure)
+    expect(model).toBeUndefined()
+  }),
+)
+
+it.instance("getSmallModel skips inferred models for Azure Cognitive Services", () =>
+  Effect.gen(function* () {
+    yield* set("AZURE_COGNITIVE_SERVICES_RESOURCE_NAME", "test-resource")
+    yield* set("AZURE_COGNITIVE_SERVICES_API_KEY", "test-key")
+    const model = yield* Provider.use.getSmallModel(ProviderV2.ID.make("azure-cognitive-services"))
+    expect(model).toBeUndefined()
   }),
 )
 
@@ -979,14 +1094,8 @@ it.instance(
 it.instance("getModel returns consistent results", () =>
   Effect.gen(function* () {
     yield* set("ANTHROPIC_API_KEY", "test-api-key")
-    const model1 = yield* Provider.use.getModel(
-      ProviderV2.ID.anthropic,
-      ProviderV2.ModelID.make("claude-sonnet-4-20250514"),
-    )
-    const model2 = yield* Provider.use.getModel(
-      ProviderV2.ID.anthropic,
-      ProviderV2.ModelID.make("claude-sonnet-4-20250514"),
-    )
+    const model1 = yield* Provider.use.getModel(ProviderV2.ID.anthropic, ModelV2.ID.make("claude-sonnet-4-20250514"))
+    const model2 = yield* Provider.use.getModel(ProviderV2.ID.anthropic, ModelV2.ID.make("claude-sonnet-4-20250514"))
     expect(model1.providerID).toEqual(model2.providerID)
     expect(model1.id).toEqual(model2.id)
     expect(model1).toEqual(model2)
@@ -1017,10 +1126,12 @@ it.instance("ModelNotFoundError includes suggestions for typos", () =>
   Effect.gen(function* () {
     yield* set("ANTHROPIC_API_KEY", "test-api-key")
     const error = yield* Provider.use
-      .getModel(ProviderV2.ID.anthropic, ProviderV2.ModelID.make("claude-sonet-4"))
+      .getModel(ProviderV2.ID.anthropic, ModelV2.ID.make("claude-sonet-4"))
       .pipe(Effect.flip)
     expect(error.suggestions).toBeDefined()
     expect((error.suggestions ?? []).length).toBeGreaterThan(0)
+    expect(error.message).toContain("Model not found: anthropic/claude-sonet-4")
+    expect(error.message).toContain("Did you mean:")
   }),
 )
 
@@ -1028,7 +1139,7 @@ it.instance("ModelNotFoundError for provider includes suggestions", () =>
   Effect.gen(function* () {
     yield* set("ANTHROPIC_API_KEY", "test-api-key")
     const error = yield* Provider.use
-      .getModel(ProviderV2.ID.make("antropic"), ProviderV2.ModelID.make("claude-sonnet-4"))
+      .getModel(ProviderV2.ID.make("antropic"), ModelV2.ID.make("claude-sonnet-4"))
       .pipe(Effect.flip)
     expect(error.suggestions).toBeDefined()
     expect(error.suggestions).toContain("anthropic")
@@ -1039,7 +1150,7 @@ it.instance("ModelNotFoundError suggests catalog models for unloaded providers",
   Effect.gen(function* () {
     yield* remove("OPENCODE_API_KEY")
     const error = yield* Provider.use
-      .getModel(ProviderV2.ID.opencode, ProviderV2.ModelID.make("claude-haiku-fake-model"))
+      .getModel(ProviderV2.ID.opencode, ModelV2.ID.make("claude-haiku-fake-model"))
       .pipe(Effect.flip)
     if (!Provider.ModelNotFoundError.isInstance(error)) throw error
     expect(error.suggestions ?? []).toContain("claude-haiku-4-5")
@@ -1577,7 +1688,7 @@ it.instance("Google Vertex: uses REP endpoint for Claude continental multi-regio
     const provider = yield* Provider.Service
     const model = yield* provider.getModel(
       ProviderV2.ID.make("google-vertex"),
-      ProviderV2.ModelID.make("claude-sonnet-4-6@default"),
+      ModelV2.ID.make("claude-sonnet-4-6@default"),
     )
     const language = yield* provider.getLanguage(model)
     expect(languageBaseURL(language)).toBe(
@@ -1593,7 +1704,7 @@ it.instance("Google Vertex Anthropic: uses REP endpoint for continental multi-re
     const provider = yield* Provider.Service
     const model = yield* provider.getModel(
       ProviderV2.ID.make("google-vertex-anthropic"),
-      ProviderV2.ModelID.make("claude-sonnet-4-6@default"),
+      ModelV2.ID.make("claude-sonnet-4-6@default"),
     )
     const language = yield* provider.getLanguage(model)
     expect(languageBaseURL(language)).toBe(
@@ -1609,7 +1720,7 @@ it.instance("Google Vertex: keeps regional Claude endpoints unchanged", () =>
     const provider = yield* Provider.Service
     const model = yield* provider.getModel(
       ProviderV2.ID.make("google-vertex"),
-      ProviderV2.ModelID.make("claude-sonnet-4-6@default"),
+      ModelV2.ID.make("claude-sonnet-4-6@default"),
     )
     const language = yield* provider.getLanguage(model)
     expect(languageBaseURL(language)).toBe(
@@ -1651,8 +1762,11 @@ it.instance(
 // Tests that need plugin file setup or multi-instance flows fall back to a
 // scoped tmpdir + provideInstance pattern via it.effect.
 
+const instanceStoreLayer = LayerNode.compile(InstanceStore.node, [
+  [InstanceStore.bootstrapNode, InstanceBootstrap.node],
+])
 const provideMultiInstance = <A, E, R>(eff: Effect.Effect<A, E, R>) =>
-  eff.pipe(Effect.provide(InstanceLayer.layer), Effect.provide(CrossSpawnSpawner.defaultLayer))
+  eff.pipe(Effect.provide(instanceStoreLayer), Effect.provide(AppNodeBuilder.build(CrossSpawnSpawner.node)))
 
 it.effect("plugin config providers persist after instance dispose", () =>
   Effect.gen(function* () {
@@ -1700,13 +1814,13 @@ it.effect("plugin config providers persist after instance dispose", () =>
 
     const first = yield* loadAndList
     expect(first[ProviderV2.ID.make("demo")]).toBeDefined()
-    expect(first[ProviderV2.ID.make("demo")].models[ProviderV2.ModelID.make("chat")]).toBeDefined()
+    expect(first[ProviderV2.ID.make("demo")].models[ModelV2.ID.make("chat")]).toBeDefined()
 
     yield* Effect.promise(() => disposeAllInstances())
 
     const second = yield* loadAndList
     expect(second[ProviderV2.ID.make("demo")]).toBeDefined()
-    expect(second[ProviderV2.ID.make("demo")].models[ProviderV2.ModelID.make("chat")]).toBeDefined()
+    expect(second[ProviderV2.ID.make("demo")].models[ModelV2.ID.make("chat")]).toBeDefined()
   }).pipe(provideMultiInstance),
 )
 
@@ -1755,7 +1869,7 @@ it.effect("opencode loader keeps paid models when config apiKey is present", () 
       Provider.use
         .list()
         .pipe(provideInstanceEffect(directory))
-        .pipe(Effect.provide(InstanceLayer.layer), Effect.provide(CrossSpawnSpawner.defaultLayer))
+        .pipe(Effect.provide(instanceStoreLayer), Effect.provide(AppNodeBuilder.build(CrossSpawnSpawner.node)))
 
     const none = paid(yield* listIn(noneDir))
     const keyedCount = paid(yield* listIn(keyedDir))
@@ -1774,7 +1888,7 @@ it.effect("opencode loader keeps paid models when auth exists", () =>
       Provider.use
         .list()
         .pipe(provideInstanceEffect(directory))
-        .pipe(Effect.provide(InstanceLayer.layer), Effect.provide(CrossSpawnSpawner.defaultLayer))
+        .pipe(Effect.provide(instanceStoreLayer), Effect.provide(AppNodeBuilder.build(CrossSpawnSpawner.node)))
 
     const none = paid(yield* listIn(noneDir))
 
